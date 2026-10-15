@@ -95,6 +95,7 @@ dialog::backdrop{background:rgba(10,15,22,.55)}
 <button class="go" id="go"></button>
 <button class="ghost hidden" id="cancel" type="button" style="width:100%;margin-top:8px">Cancel</button>
 <div class="msg" id="msg"></div>
+<details id="logbox" class="hidden" style="margin-top:8px"><summary class="legend" style="cursor:pointer">Attempt details</summary><pre id="log" style="white-space:pre-wrap;font-size:12px;color:var(--mute);margin:6px 0 0"></pre></details>
 </div>
 </div>
 <div>
@@ -116,6 +117,9 @@ dialog::backdrop{background:rgba(10,15,22,.55)}
 <label for="models">Models, in order (one per line)</label>
 <textarea id="models" rows="6" autocomplete="off" spellcheck="false"></textarea>
 <div class="legend">The first model is tried first. If it is out of quota, busy or retired, the app moves to the next. Use exact model IDs from AI Studio.</div>
+<label style="font-weight:400;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="fast" style="margin-top:5px"><span>Fast mode: ask Gemini 3 models to think less (usually much quicker). It is skipped automatically if a model rejects it.</span></label>
+<label for="wait">Wait per model, in seconds (30 to 300)</label>
+<input type="text" id="wait" inputmode="numeric" autocomplete="off">
 <h3 style="margin-top:20px">Prompt</h3>
 <div class="row" style="margin-top:6px">
 <button type="button" class="ghost seg" data-m="draft">Draft review</button>
@@ -165,15 +169,17 @@ posted:{sub:'Break down a video that is already posted, such as a competitor Sho
 // ---- saved settings ----
 const DEFAULT_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite','gemini-2.5-flash-lite','gemini-2.5-flash'];
 let usedModel='',lastCaption='';
-const S={key:'',models:null,active:{draft:null,posted:null},names:{draft:'Default',posted:'Default'},vers:{draft:[],posted:[]}};
+const S={key:'',models:null,fast:true,wait:90,active:{draft:null,posted:null},names:{draft:'Default',posted:'Default'},vers:{draft:[],posted:[]}};
 try{Object.assign(S,JSON.parse(localStorage.getItem('mpvr')||'{}'))}catch(e){}
 if(!Array.isArray(S.models)||!S.models.length)S.models=DEFAULT_MODELS.slice();
 const persist=()=>{try{localStorage.setItem('mpvr',JSON.stringify(S))}catch(e){}};
 const promptOf=m=>S.active[m]||DEF[m];
+if(!S.v4){S.wait=60;S.v4=1;persist()}
+if(!S.v5){S.wait=180;S.v5=1;persist()}
 
 let mode='draft',file=null,cuts=[],dur=0,canSeek=false,up={},cc={};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const TIMEOUT=150000;let ctrl=null,cancelled=false;
+const TOTAL_CAP=900000;const RETRY_WAITS=[8,16,32];let ctrl=null,cancelled=false;
 const delRemote=(k)=>{if(up.info)fetch(API+'/v1beta/'+up.info.name+'?key='+encodeURIComponent(S.key),{method:'DELETE',keepalive:!!k}).catch(()=>{});up={}};
 addEventListener('pagehide',()=>delRemote(true));
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -274,30 +280,42 @@ async function uploadFile(){
   if(f.state!=='ACTIVE')throw new Error('Video processing failed or timed out.');
   return f;
 }
-async function generateWithRetry(body){
-  const models=S.models&&S.models.length?S.models:DEFAULT_MODELS,skipped=[];let last='';
+const logAdd=t=>{$('logbox').classList.remove('hidden');const l=$('log');l.textContent+=(l.textContent?'\n':'')+t};
+async function generateWithRetry(base){
+  const models=S.models&&S.models.length?S.models:DEFAULT_MODELS,skipped=[],start=Date.now();let last='';
+  $('log').textContent='';
+  const bodyFor=think=>JSON.stringify({...base,generationConfig:{...base.generationConfig,...(think?{thinkingConfig:{thinkingLevel:'low'}}:{})}});
   for(let i=0;i<models.length;i++){
-    const m=models[i];
-    for(let a=0;a<2;a++){
-      if(a>0){for(let w=5;w>0;w--){setMsg(m+' is busy. Retrying once in '+w+'s…');await sleep(1000)}}
+    const m=models[i];let think=S.fast!==false&&/^gemini-3/.test(m),retries=0;
+    while(true){
       if(cancelled)throw new Error('Cancelled.');
-      const label='Gemini is watching the video… ('+m+(i>0?', fallback '+i:'')+')',t0=Date.now();
-      setMsg(label);const tick=setInterval(()=>setMsg(label+' '+Math.round((Date.now()-t0)/1000)+'s'),1000);
-      ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),TIMEOUT);
+      const left=TOTAL_CAP-(Date.now()-start);
+      if(left<15000)throw new Error('Stopped after '+Math.round((Date.now()-start)/1000)+'s. '+(skipped.length?'Tried: '+skipped.join('; ')+'. ':'')+'Try again in a few minutes.');
+      const tmo=Math.min((S.wait||180)*1000,left),maxs=Math.round(tmo/1000);
+      const label='Gemini is watching the video… ('+m+(i>0?', fallback '+i:'')+(think?', fast mode':'')+')',t0=Date.now();
+      setMsg(label);const tick=setInterval(()=>setMsg(label+' '+Math.round((Date.now()-t0)/1000)+'s of '+maxs+'s'),1000);
+      ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),tmo);
       let res,j;
-      try{res=await fetch(API+'/v1beta/models/'+encodeURIComponent(m)+':generateContent?key='+encodeURIComponent(S.key),{method:'POST',headers:{'Content-Type':'application/json'},body,signal:ctrl.signal});j=await res.json().catch(()=>({}))}
-      catch(e){if(cancelled)throw new Error('Cancelled.');last='No response from '+m+' after '+(TIMEOUT/1000)+'s';skipped.push(m+': no response');break}
+      try{res=await fetch(API+'/v1beta/models/'+encodeURIComponent(m)+':generateContent?key='+encodeURIComponent(S.key),{method:'POST',headers:{'Content-Type':'application/json'},body:bodyFor(think),signal:ctrl.signal});j=await res.json().catch(()=>({}))}
+      catch(e){if(cancelled)throw new Error('Cancelled.');last='No response from '+m+' after '+maxs+'s';skipped.push(m+': no response');logAdd(m+': no response after '+maxs+'s, moving on');break}
       finally{clearInterval(tick);clearTimeout(to)}
-      if(res.ok){usedModel=m;return j}
-      const msg=j.error?.message||('HTTP '+res.status);last=msg;
+      const secs=Math.round((Date.now()-t0)/1000);
+      if(res.ok){logAdd(m+': OK ('+secs+'s)');usedModel=m;return j}
+      const msg=j.error?.message||('HTTP '+res.status);last=msg;logAdd(m+': '+res.status+' '+msg.slice(0,90)+' ('+secs+'s)');
+      if(res.status===400&&think&&/think/i.test(msg)){think=false;continue}
       if(res.status===401||res.status===403||/api key|API_KEY_INVALID|unauthenticated/i.test(msg))throw new Error(msg);
       if(res.status===404||/not found|no longer|deprecated|not supported|unsupported/i.test(msg)){skipped.push(m+': not available');break}
-      if(res.status===429){skipped.push(m+': quota reached');break}
-      if(res.status===503||/high demand|overloaded|unavailable/i.test(msg)){if(a===0)continue;skipped.push(m+': busy');break}
-      throw new Error(msg);
+      const retryable=res.status===429||res.status>=500||/high demand|overloaded|unavailable|try again/i.test(msg);
+      if(!retryable)throw new Error(msg);
+      if(retries<RETRY_WAITS.length){
+        const w=RETRY_WAITS[retries];retries++;
+        for(let c=w;c>0;c--){if(cancelled)throw new Error('Cancelled.');setMsg(m+': '+(res.status===429?'rate limit':'busy or error')+'. Retry '+retries+' of '+RETRY_WAITS.length+' in '+c+'s…');await sleep(1000)}
+        continue;
+      }
+      skipped.push(m+': '+(res.status===429?'quota reached':'busy or error'));break;
     }
   }
-  throw new Error('All models failed ('+skipped.join('; ')+'). Wait about a minute and try again. Last message: '+last);
+  throw new Error('All models failed ('+skipped.join('; ')+'). Wait a few minutes and try again. Last message: '+last);
 }
 $('go').onclick=async()=>{
   if(!S.key){setMsg('Add your API key in Settings first.',1);openSettings();return}
@@ -317,7 +335,7 @@ $('go').onclick=async()=>{
       else{if(!up.info)up={info:await uploadFile()};part={file_data:{mime_type:up.info.mimeType||file.type||'video/mp4',file_uri:up.info.uri}}}
     }
     const text=`${promptOf(run)}\n${stats}\nCreator's question: ${$('note').value.trim()||'(none)'}\nReturn ONLY JSON with this shape:\n${SCHEMA[run]}`;
-    const j=await generateWithRetry(JSON.stringify({contents:[{parts:[part,{text}]}],generationConfig:{responseMimeType:'application/json',temperature:0.4}}));
+    const j=await generateWithRetry({contents:[{parts:[part,{text}]}],generationConfig:{responseMimeType:'application/json',temperature:0.4}});
     const txt=j.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
     if(!txt)throw new Error('Empty response. The video may have been blocked, or the model name may be wrong.');
     const data=JSON.parse(txt.replace(/```json|```/g,'').trim());
@@ -372,7 +390,7 @@ function renderEd(){
    +S.vers[editing].map((x,i)=>'<div class="vi"><button type="button" class="t" data-i="'+i+'">'+esc(x.name)+'</button><button type="button" class="x" data-d="'+i+'" aria-label="Delete '+esc(x.name)+'">×</button></div>').join('');
 }
 function openSettings(){
-  $('key').value=S.key;$('models').value=S.models.join('\n');
+  $('key').value=S.key;$('models').value=S.models.join('\n');$('fast').checked=S.fast!==false;$('wait').value=S.wait||180;
   ['draft','posted'].forEach(m=>{buf[m]=promptOf(m);bufName[m]=S.names[m]});
   editing=mode;$('vmsg').textContent='Saving with an existing name updates that version.';renderEd();dlg.showModal();
 }
@@ -395,7 +413,7 @@ $('svv').onclick=()=>{
 };
 $('rst').onclick=()=>{buf[editing]=DEF[editing];bufName[editing]='Default';renderEd()};
 $('sv').onclick=()=>{
-  S.key=$('key').value.trim();S.models=$('models').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);if(!S.models.length)S.models=DEFAULT_MODELS.slice();
+  S.key=$('key').value.trim();S.fast=$('fast').checked;S.wait=Math.min(300,Math.max(30,parseInt($('wait').value)||180));S.models=$('models').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);if(!S.models.length)S.models=DEFAULT_MODELS.slice();
   ['draft','posted'].forEach(m=>{const t=buf[m].trim();S.active[m]=(!t||t===DEF[m])?null:t;S.names[m]=S.active[m]?bufName[m]:'Default'});
   persist();dlg.close();
 };

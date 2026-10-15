@@ -25,7 +25,7 @@ Pick ONE option. Screens may look slightly different from these steps.
 Edit in CapCut, export, open VidRev, tap the upload box (your gallery opens), pick the video, review.
 
 ## Updating later
-Replace index.html in your hosting with the new version. In sw.js change the cache version (`mpvr-v2` to `mpvr-v3`, and so on) so phones pick up the new copy. Your key and saved prompts stay on the phone.
+Replace index.html in your hosting with the new version. In sw.js change the cache version (`mpvr-v5` to `mpvr-v6`, and so on) so phones pick up the new copy. Your key and saved prompts stay on the phone.
 
 ## Good to know
 - Your API key is not inside any file. Each device enters its own key in Settings.
@@ -37,3 +37,5 @@ Replace index.html in your hosting with the new version. In sw.js change the cac
 - **Model fallback list** in Settings: one model ID per line; the app moves to the next one when a model is out of quota, busy or retired.
 - **Export / Import versions** in Settings. Leave "Include API key" unticked unless you really need it, and never upload a backup file to GitHub.
 - **Share to VidRev** (optional): in your gallery or CapCut, tap Share and pick VidRev. After updating the files on GitHub, uninstall VidRev from your phone and install it again from Chrome once, so Android registers the Share option.
+- **Fast mode** (Settings, on by default): asks Gemini 3 models to think less, so reviews come back much sooner. **Wait per model** (default 90 s) and a 4-minute overall limit stop the app from waiting too long.
+- **Waiting and retries**: each model gets up to 180 seconds (changeable in Settings) to answer. On a busy or error reply the app retries after 8, 16 and 32 seconds (3 retries), then moves to the next model in your list, always starting from the top. If a model gives no answer within the wait time, it moves on immediately. **Attempt details** under the status line shows what each model did and how long it took.
