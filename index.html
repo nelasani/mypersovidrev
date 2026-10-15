@@ -113,10 +113,9 @@ dialog::backdrop{background:rgba(10,15,22,.55)}
 <h2>Settings</h2>
 <label for="key">Gemini API key</label>
 <div class="row"><input type="password" id="key" placeholder="Paste key from aistudio.google.com" autocomplete="off"><button type="button" class="ghost" id="eye">Show</button></div>
-<label for="model">Model</label>
-<input type="text" id="model" autocomplete="off">
-<label for="backup">Backup model (used if the main one stays busy)</label>
-<input type="text" id="backup" placeholder="Leave empty for no backup" autocomplete="off">
+<label for="models">Models, in order (one per line)</label>
+<textarea id="models" rows="6" autocomplete="off" spellcheck="false"></textarea>
+<div class="legend">The first model is tried first. If it is out of quota, busy or retired, the app moves to the next. Use exact model IDs from AI Studio.</div>
 <h3 style="margin-top:20px">Prompt</h3>
 <div class="row" style="margin-top:6px">
 <button type="button" class="ghost seg" data-m="draft">Draft review</button>
@@ -128,6 +127,10 @@ dialog::backdrop{background:rgba(10,15,22,.55)}
 <div class="vers" id="vers"></div>
 <div class="row" style="margin-top:8px"><input type="text" id="vname" placeholder="Version name, e.g. v2 funnier tone" autocomplete="off"><button type="button" class="ghost" id="svv">Save version</button></div>
 <div class="legend" id="vmsg">Saving with an existing name updates that version.</div>
+<h3 style="margin-top:18px">Backup</h3>
+<div class="row" style="margin-top:6px"><button type="button" class="ghost" id="exp">Export versions</button><button type="button" class="ghost" id="imp">Import versions</button><input type="file" id="impf" accept=".json,application/json" class="hidden"></div>
+<label style="font-weight:400;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="exkey" style="margin-top:5px"><span>Include API key in the backup (off by default). A file containing your key works like a password: keep it private and never upload it to GitHub.</span></label>
+<div class="legend" id="bmsg"></div>
 <p class="legend">Everything is stored only in this browser on this computer, never in the HTML file.</p>
 <div class="row end"><button type="button" class="ghost" id="rst">Reset prompt to default</button><button type="button" class="go" id="sv" style="width:auto;margin:0;padding:10px 20px">Save</button></div>
 </dialog>
@@ -160,8 +163,11 @@ draft:{sub:'Upload an unposted video. Cuts and pacing are measured in your brows
 posted:{sub:'Break down a video that is already posted, such as a competitor Short, to see why it works and how to adapt the technique to your style.',lbl:'What do you want to learn from it? (optional)',ph:'Why does the opening work? How is the pacing built?',go:'Analyze video'}};
 
 // ---- saved settings ----
-const S={key:'',model:'gemini-3.8-flash',backup:'gemini-3.6-flash',active:{draft:null,posted:null},names:{draft:'Default',posted:'Default'},vers:{draft:[],posted:[]}};
+const DEFAULT_MODELS=['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite','gemini-2.5-flash-lite','gemini-2.5-flash'];
+let usedModel='',lastCaption='';
+const S={key:'',models:null,active:{draft:null,posted:null},names:{draft:'Default',posted:'Default'},vers:{draft:[],posted:[]}};
 try{Object.assign(S,JSON.parse(localStorage.getItem('mpvr')||'{}'))}catch(e){}
+if(!Array.isArray(S.models)||!S.models.length)S.models=DEFAULT_MODELS.slice();
 const persist=()=>{try{localStorage.setItem('mpvr',JSON.stringify(S))}catch(e){}};
 const promptOf=m=>S.active[m]||DEF[m];
 
@@ -177,7 +183,7 @@ const li=a=>(a||[]).map(x=>'<li>'+esc(x)+'</li>').join('');
 
 function status(){
   const k=!!S.key;
-  $('status').textContent=k?('API key saved · '+S.model+' · prompt: '+(S.names[mode]==='Default'?'default':S.names[mode])):'No API key yet. Open Settings to add one.';
+  $('status').textContent=k?('API key saved · '+S.models[0]+(S.models.length>1?' (+'+(S.models.length-1)+' fallback)':'')+' · prompt: '+(S.names[mode]==='Default'?'default':S.names[mode])):'No API key yet. Open Settings to add one.';
   $('status').className='legend'+(k?'':' err');
 }
 function setMode(m){
@@ -268,26 +274,30 @@ async function uploadFile(){
   if(f.state!=='ACTIVE')throw new Error('Video processing failed or timed out.');
   return f;
 }
-const isBusy=(res,j)=>res.status===503||res.status===429||/high demand|overloaded|unavailable|try again later/i.test(j.error?.message||'');
 async function generateWithRetry(body){
-  const models=[S.model].concat(S.backup&&S.backup!==S.model?[S.backup]:[]);let last='';
-  for(const m of models){
-    for(let a=0;a<=3;a++){
-      if(a>0){for(let w=[4,8,16][a-1];w>0;w--){setMsg(m+' is busy. Retrying in '+w+'s (attempt '+a+' of 3)…');await sleep(1000)}}
+  const models=S.models&&S.models.length?S.models:DEFAULT_MODELS,skipped=[];let last='';
+  for(let i=0;i<models.length;i++){
+    const m=models[i];
+    for(let a=0;a<2;a++){
+      if(a>0){for(let w=5;w>0;w--){setMsg(m+' is busy. Retrying once in '+w+'s…');await sleep(1000)}}
       if(cancelled)throw new Error('Cancelled.');
-      const label='Gemini is watching the video… ('+m+(m!==S.model?', backup':'')+')',t0=Date.now();
+      const label='Gemini is watching the video… ('+m+(i>0?', fallback '+i:'')+')',t0=Date.now();
       setMsg(label);const tick=setInterval(()=>setMsg(label+' '+Math.round((Date.now()-t0)/1000)+'s'),1000);
       ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),TIMEOUT);
       let res,j;
       try{res=await fetch(API+'/v1beta/models/'+encodeURIComponent(m)+':generateContent?key='+encodeURIComponent(S.key),{method:'POST',headers:{'Content-Type':'application/json'},body,signal:ctrl.signal});j=await res.json().catch(()=>({}))}
-      catch(e){if(cancelled)throw new Error('Cancelled.');last='No response from '+m+' after '+(TIMEOUT/1000)+'s';break}
+      catch(e){if(cancelled)throw new Error('Cancelled.');last='No response from '+m+' after '+(TIMEOUT/1000)+'s';skipped.push(m+': no response');break}
       finally{clearInterval(tick);clearTimeout(to)}
-      if(res.ok)return j;
-      last=j.error?.message||('HTTP '+res.status);
-      if(!isBusy(res,j))throw new Error(last);
+      if(res.ok){usedModel=m;return j}
+      const msg=j.error?.message||('HTTP '+res.status);last=msg;
+      if(res.status===401||res.status===403||/api key|API_KEY_INVALID|unauthenticated/i.test(msg))throw new Error(msg);
+      if(res.status===404||/not found|no longer|deprecated|not supported|unsupported/i.test(msg)){skipped.push(m+': not available');break}
+      if(res.status===429){skipped.push(m+': quota reached');break}
+      if(res.status===503||/high demand|overloaded|unavailable/i.test(msg)){if(a===0)continue;skipped.push(m+': busy');break}
+      throw new Error(msg);
     }
   }
-  throw new Error(last+' (backup model tried too). Please try again in a few minutes.');
+  throw new Error('All models failed ('+skipped.join('; ')+'). Wait about a minute and try again. Last message: '+last);
 }
 $('go').onclick=async()=>{
   if(!S.key){setMsg('Add your API key in Settings first.',1);openSettings();return}
@@ -311,7 +321,7 @@ $('go').onclick=async()=>{
     const txt=j.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'';
     if(!txt)throw new Error('Empty response. The video may have been blocked, or the model name may be wrong.');
     const data=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    run==='draft'?renderDraft(data):renderPosted(data);setMsg('Done.');
+    run==='draft'?renderDraft(data):renderPosted(data);setMsg('Done. Model used: '+usedModel+'.');
   }catch(e){setMsg('Error: '+e.message,1)}
   $('go').disabled=false;$('cancel').classList.add('hidden');
 };
@@ -321,13 +331,13 @@ const tl=t=>canSeek?'<button class="t" data-t="'+(+t||0)+'">'+fmt(t)+'</button>'
 const bindSeek=()=>$('out').querySelectorAll('.t').forEach(b=>b.onclick=()=>seek(+b.dataset.t));
 function hookBlock(h,extra){return '<div class="panel"><h2>Hook</h2><div class="score">'+esc(h.score)+'<small>/10</small></div><p>'+esc(h.verdict)+'</p>'+extra+'</div>'}
 function renderDraft(r){
-  const h=r.hook||{},dr=r.dropoffs||[];
+  const h=r.hook||{},dr=r.dropoffs||[];lastCaption=String(r.caption||'').replace(/\\n/g,'\n').trim();
   drawStrip(dr.map(d=>+d.time).filter(t=>t>=0&&t<=dur));
   $('out').innerHTML=hookBlock(h,'<h3>Stronger openings to try</h3>'+(h.rewrites||[]).map(x=>'<div class="box">'+esc(x)+'</div>').join(''))
    +'<div class="panel"><h2>What is working</h2><ul>'+li(r.working)+'</ul></div>'
    +'<div class="panel"><h2>Where viewers may leave</h2>'+(dr.length?dr.map(d=>'<div class="item">'+tl(d.time)+' — '+esc(d.reason)+'<br><b>Fix:</b> '+esc(d.fix)+'</div>').join(''):'<p>No clear drop-off points found.</p>')+'</div>'
    +'<div class="panel"><h2>Fix before posting</h2><ul>'+li(r.fixes)+'</ul></div>'
-   +'<div class="panel"><h2>Caption</h2><div class="box cap">'+esc(r.caption)+'</div></div>';
+   +'<div class="panel"><h2>Caption</h2><div class="box cap">'+esc(lastCaption)+'</div><button class="ghost" id="copycap" type="button" style="margin-top:10px">Copy caption</button></div>';
   bindSeek();
 }
 function renderPosted(r){
@@ -342,6 +352,16 @@ function renderPosted(r){
 
 $('cancel').onclick=()=>{cancelled=true;if(ctrl)ctrl.abort();setMsg('Cancelling…')};
 
+async function copyCaption(b){
+  let ok=false;
+  try{await navigator.clipboard.writeText(lastCaption);ok=true}catch(e){
+    const t=document.createElement('textarea');t.value=lastCaption;t.style.cssText='position:fixed;opacity:0';document.body.appendChild(t);t.select();
+    try{ok=document.execCommand('copy')}catch(_){}t.remove()}
+  b.textContent=ok?'Copied ✓':'Copy failed: select the text and copy it manually';
+  setTimeout(()=>{b.textContent='Copy caption'},2500);
+}
+$('out').addEventListener('click',e=>{const b=e.target.closest('#copycap');if(b)copyCaption(b)});
+
 // ---- settings dialog ----
 const dlg=$('dlg'),buf={draft:'',posted:''},bufName={draft:'',posted:''};let editing='draft';
 function renderEd(){
@@ -352,7 +372,7 @@ function renderEd(){
    +S.vers[editing].map((x,i)=>'<div class="vi"><button type="button" class="t" data-i="'+i+'">'+esc(x.name)+'</button><button type="button" class="x" data-d="'+i+'" aria-label="Delete '+esc(x.name)+'">×</button></div>').join('');
 }
 function openSettings(){
-  $('key').value=S.key;$('model').value=S.model;$('backup').value=S.backup||'';
+  $('key').value=S.key;$('models').value=S.models.join('\n');
   ['draft','posted'].forEach(m=>{buf[m]=promptOf(m);bufName[m]=S.names[m]});
   editing=mode;$('vmsg').textContent='Saving with an existing name updates that version.';renderEd();dlg.showModal();
 }
@@ -375,14 +395,47 @@ $('svv').onclick=()=>{
 };
 $('rst').onclick=()=>{buf[editing]=DEF[editing];bufName[editing]='Default';renderEd()};
 $('sv').onclick=()=>{
-  S.key=$('key').value.trim();S.model=$('model').value.trim()||'gemini-3.8-flash';S.backup=$('backup').value.trim();
+  S.key=$('key').value.trim();S.models=$('models').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);if(!S.models.length)S.models=DEFAULT_MODELS.slice();
   ['draft','posted'].forEach(m=>{const t=buf[m].trim();S.active[m]=(!t||t===DEF[m])?null:t;S.names[m]=S.active[m]?bufName[m]:'Default'});
   persist();dlg.close();
+};
+const bmsg=t=>{$('bmsg').textContent=t};
+$('exp').onclick=()=>{
+  const out={app:'MyPersoVidRev',version:2,vers:S.vers,active:S.active,names:S.names,models:S.models},withKey=$('exkey').checked;
+  if(withKey)out.key=S.key;
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(out,null,1)],{type:'application/json'}));
+  a.download='MyPersoVidRev-backup'+(withKey?'-WITH-KEY':'')+'.json';document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1500);
+  bmsg('Backup saved to your Downloads'+(withKey?'. It contains your API key: keep it private.':'.'));
+};
+$('imp').onclick=()=>$('impf').click();
+$('impf').onchange=async e=>{
+  const f=e.target.files[0];e.target.value='';if(!f)return;
+  try{
+    const d=JSON.parse(await f.text());if(d.app!=='MyPersoVidRev')throw new Error('This is not a MyPersoVidRev backup.');
+    let added=0,updated=0;
+    ['draft','posted'].forEach(m=>(d.vers?.[m]||[]).forEach(v=>{
+      if(!v||!v.name||!v.text)return;const i=S.vers[m].findIndex(x=>x.name===v.name);
+      if(i>=0){S.vers[m][i].text=v.text;updated++}else{S.vers[m].push({name:v.name,text:v.text});added++}}));
+    if(Array.isArray(d.models)&&d.models.length){S.models=d.models.filter(x=>typeof x==='string'&&x.trim());$('models').value=S.models.join('\n')}
+    if(d.key&&confirm('This backup contains an API key. Replace the saved key with it?')){S.key=String(d.key);$('key').value=S.key}
+    ['draft','posted'].forEach(m=>{if(d.active?.[m]){S.active[m]=d.active[m];S.names[m]=d.names?.[m]||'custom';buf[m]=S.active[m];bufName[m]=S.names[m]}});
+    persist();renderEd();bmsg('Imported: '+added+' new and '+updated+' updated versions.');
+  }catch(err){bmsg('Import failed: '+err.message)}
 };
 dlg.addEventListener('close',()=>{$('key').type='password';$('eye').textContent='Show';status()});
 
 setMode('draft');
 if(!S.key)openSettings();
+if(new URLSearchParams(location.search).get('shared')){
+  history.replaceState(null,'',location.pathname);
+  (async()=>{try{
+    const c=await caches.open('mpvr-share'),r=await c.match('shared-video');
+    if(r){const b=await r.blob(),name=decodeURIComponent(r.headers.get('X-Name')||'shared-video.mp4');
+      await c.delete('shared-video');pick(new File([b],name,{type:b.type||'video/mp4'}));if(!$('msg').classList.contains('err'))setMsg('Video received from Share.')}
+    else setMsg('Nothing was received from Share. Use the upload box instead.',1);
+  }catch(e){setMsg('Could not load the shared video. Use the upload box instead.',1)}})();
+}
 if('serviceWorker' in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('sw.js').catch(()=>{});
 </script>
 </body>

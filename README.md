@@ -25,9 +25,15 @@ Pick ONE option. Screens may look slightly different from these steps.
 Edit in CapCut, export, open VidRev, tap the upload box (your gallery opens), pick the video, review.
 
 ## Updating later
-Replace index.html in your hosting with the new version. In sw.js change `mpvr-v1` to `mpvr-v2` (then v3, ...) so phones pick up the new copy. Your key and saved prompts stay on the phone.
+Replace index.html in your hosting with the new version. In sw.js change the cache version (`mpvr-v2` to `mpvr-v3`, and so on) so phones pick up the new copy. Your key and saved prompts stay on the phone.
 
 ## Good to know
 - Your API key is not inside any file. Each device enters its own key in Settings.
 - Settings and saved prompt versions live in that phone's Chrome. Clearing Chrome's data erases them, so keep a copy of prompts you like.
 - Anyone who finds your web address can open the app, but it does nothing without their own key.
+
+## New in this version
+- **Copy caption** button under the caption in Draft review.
+- **Model fallback list** in Settings: one model ID per line; the app moves to the next one when a model is out of quota, busy or retired.
+- **Export / Import versions** in Settings. Leave "Include API key" unticked unless you really need it, and never upload a backup file to GitHub.
+- **Share to VidRev** (optional): in your gallery or CapCut, tap Share and pick VidRev. After updating the files on GitHub, uninstall VidRev from your phone and install it again from Chrome once, so Android registers the Share option.
